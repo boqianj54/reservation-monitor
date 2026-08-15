@@ -108,7 +108,12 @@ def send(
     host = _host()
     invalid: list[str] = []
     with httpx.Client(http2=True, timeout=30) as client:
-        for token in device_tokens():
+        for index, token in enumerate(device_tokens(), start=1):
+            # Never log any part of a device token: this runs in a public repo,
+            # and GitHub only masks *exact* matches of a secret's value, so even
+            # a short prefix would show up verbatim in the build log. Identify
+            # the device by its position in APNS_DEVICE_TOKENS instead.
+            label = f"device #{index}"
             resp = client.post(
                 f"{host}/3/device/{token}", json=payload, headers=headers
             )
@@ -126,13 +131,13 @@ def send(
             if reason in {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}:
                 invalid.append(token)
                 print(
-                    f"  ! device {token[:12]}… rejected ({reason}); "
+                    f"  ! {label} rejected ({reason}); "
                     f"check APNS_ENV (currently {os.environ.get('APNS_ENV', 'sandbox')})"
                 )
                 continue
 
             raise APNsError(
                 f"APNs returned {resp.status_code} ({reason or 'no reason'}) "
-                f"for device {token[:12]}…"
+                f"for {label}"
             )
     return invalid
