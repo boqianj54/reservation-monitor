@@ -10,20 +10,40 @@ import argparse
 import datetime as dt
 import json
 import sys
+from zoneinfo import ZoneInfo
 
-from check import Opening, find_openings, _load_config
+from check import Opening, ScanResult, find_openings, _load_config
 
 STATE_PATH = "state.json"
 BOOKING_URL = "https://www.sevenrooms.com/reservations/{slug}"
 # How many openings to spell out in the notification body before summarising.
 MAX_LISTED = 3
+# Keep alerts alive for a day: the whole point of cloud hosting is that the
+# phone may be off or offline for hours, and APNs drops anything past expiry.
+ALERT_TTL_SECONDS = 24 * 3600
+# Fail the run if more than this fraction of days could not be checked, so a
+# widespread outage goes red instead of quietly reporting "no openings".
+MAX_FAILED_FRACTION = 0.5
+
+
+def venue_today(config: dict) -> dt.date:
+    """Today's date *at the venue*.
+
+    The runner is UTC and slot keys are venue-local. Using the UTC date would
+    expire the current evening's slots up to 10 hours early in Hawaii, which
+    makes a still-live slot look new again on the very next run.
+    """
+    tz = config.get("timezone")
+    if not tz:
+        return dt.date.today()
+    return dt.datetime.now(ZoneInfo(tz)).date()
 
 
 def load_state(path: str = STATE_PATH) -> dict:
     try:
         with open(path) as f:
             state = json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {"notified": {}}
     state.setdefault("notified", {})
     return state
@@ -35,16 +55,43 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
         f.write("\n")
 
 
+def slot_date(key: str) -> str:
+    """Date portion of a state key ("venue|party|YYYY-MM-DD HH:MM:SS")."""
+    return key.rsplit("|", 1)[-1][:10]
+
+
 def prune_state(state: dict, today: dt.date) -> dict:
-    """Drop slots whose date has passed so state.json cannot grow forever."""
-    cutoff = today.isoformat()
+    """Drop slots whose date has passed so state.json cannot grow forever.
+
+    Keeps one extra day of slack so a timezone edge can never expire a slot
+    that the API is still offering.
+    """
+    cutoff = (today - dt.timedelta(days=1)).isoformat()
     state["notified"] = {
         key: seen_at
         for key, seen_at in state["notified"].items()
-        # Keys are "YYYY-MM-DD HH:MM:SS", so a plain string compare works.
-        if key[:10] >= cutoff
+        if slot_date(key) >= cutoff
     }
     return state
+
+
+def forget_vanished(state: dict, scan: ScanResult) -> list[str]:
+    """Stop suppressing slots that are no longer offered.
+
+    A table that gets booked and later cancelled is the single most valuable
+    event this tool can catch, so once a slot disappears we must forget it —
+    otherwise its reappearance would be silently swallowed. Only days we
+    actually reached are considered, so an API failure can't cause a false
+    "vanished" and a spurious re-alert.
+    """
+    live = {o.key() for o in scan.openings}
+    dropped = [
+        key for key in state["notified"]
+        if slot_date(key) in scan.scanned_dates and key not in live
+    ]
+    for key in dropped:
+        del state["notified"][key]
+    return dropped
 
 
 def format_alert(openings: list[Opening], config: dict) -> tuple[str, str]:
@@ -83,57 +130,95 @@ def main() -> int:
     if args.test_notification:
         import notify
 
-        notify.send(
+        invalid = notify.send(
             f"Test — {config['venue_name']}",
             "If you can read this, APNs delivery is working.",
             collapse_id="test",
         )
+        if invalid:
+            raise RuntimeError(
+                f"{len(invalid)} device token(s) were rejected by APNs — "
+                "the test push was not delivered to them."
+            )
         print("Test notification sent.")
         return 0
 
-    openings = find_openings(config)
+    scan = find_openings(config)
+    total_days = len(scan.scanned_dates) + len(scan.failed_dates)
+    if scan.failed_dates:
+        print(f"WARNING: {len(scan.failed_dates)}/{total_days} day(s) could not be checked:")
+        for date_str, err in sorted(scan.failed_dates.items()):
+            print(f"  {date_str}: {err}")
+
     print(
         f"Checked {config['venue_name']} "
         f"({config['date_start']} to {config['date_end']}, "
-        f"party of {config['party_size']}): {len(openings)} bookable slot(s)."
+        f"party of {config['party_size']}): {len(scan.openings)} bookable slot(s) "
+        f"across {len(scan.scanned_dates)} day(s)."
     )
-    for o in openings:
-        print(f"  {o.date} ({o.shift}) — {o.time_label}")
+    for o in scan.openings:
+        print(f"  {o.date} — {o.time_label}")
 
     state = load_state()
+    forgotten = forget_vanished(state, scan)
+    if forgotten:
+        print(f"{len(forgotten)} previously-notified slot(s) no longer offered "
+              f"(will alert again if they return).")
+
     already = state["notified"]
-    new = [o for o in openings if o.key() not in already]
+    new = [o for o in scan.openings if o.key() not in already]
 
-    if not new:
-        print("Nothing new to notify.")
-        # Still prune + save so expired entries age out even on quiet runs.
-        if not args.dry_run:
-            save_state(prune_state(state, dt.date.today()))
-        return 0
+    today = venue_today(config)
+    # A heartbeat keeps state.json changing at least daily. Without it the file
+    # only changes when an opening appears, and GitHub disables scheduled
+    # workflows on repos with no activity for 60 days — which for a venue that
+    # books out months ahead means the monitor switches itself off unnoticed.
+    state["last_checked_date"] = today.isoformat()
 
-    print(f"{len(new)} newly appeared opening(s):")
-    for o in new:
-        print(f"  NEW  {o.date} — {o.time_label}")
+    if new:
+        print(f"{len(new)} newly appeared opening(s):")
+        for o in new:
+            print(f"  NEW  {o.date} — {o.time_label}")
 
     if args.dry_run:
         print("Dry run — no notification sent, state not saved.")
         return 0
 
-    import notify
+    if new:
+        import notify
 
-    title, body = format_alert(new, config)
-    notify.send(
-        title,
-        body,
-        collapse_id=config["venue_slug"],
-        extra={"url": BOOKING_URL.format(slug=config["venue_slug"])},
-    )
-    print(f"Notified: {title} — {body}")
+        title, body = format_alert(new, config)
+        invalid = notify.send(
+            title,
+            body,
+            collapse_id=None,  # each alert must stand alone; see notify.send
+            extra={"url": BOOKING_URL.format(slug=config["venue_slug"])},
+            expiration_seconds=ALERT_TTL_SECONDS,
+        )
+        if invalid and len(invalid) == len(notify.device_tokens()):
+            # Every device is unreachable, so nobody was told. Fail loudly and
+            # do NOT record these as notified, or the alert is lost forever.
+            raise RuntimeError(
+                "APNs rejected every configured device token — no one was "
+                "notified. The app was probably reinstalled; refresh the "
+                "APNS_DEVICE_TOKENS secret from the app."
+            )
+        print(f"Notified: {title} — {body}")
 
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    for o in new:
-        already[o.key()] = now
-    save_state(prune_state(state, dt.date.today()))
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        for o in new:
+            already[o.key()] = now
+    else:
+        print("Nothing new to notify.")
+
+    save_state(prune_state(state, today))
+
+    # Surface a widespread outage as a failed run rather than a quiet "0 slots".
+    if total_days and len(scan.failed_dates) / total_days > MAX_FAILED_FRACTION:
+        raise RuntimeError(
+            f"{len(scan.failed_dates)} of {total_days} days could not be checked; "
+            "availability results are unreliable."
+        )
     return 0
 
 
