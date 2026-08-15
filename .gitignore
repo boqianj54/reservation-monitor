@@ -18,3 +18,7 @@ ios/**/DerivedData/
 
 # Local-only project context for Claude (personal notes)
 CLAUDE.md
+
+# Real search criteria stay local; CI reads them from the MONITOR_CONFIG secret.
+# See config.example.json for the shape.
+config.json

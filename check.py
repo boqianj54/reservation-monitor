@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -144,8 +145,23 @@ def find_openings(config: dict) -> ScanResult:
 
 
 def _load_config(path: str = "config.json") -> dict:
-    with open(path) as f:
-        return json.load(f)
+    """Load search criteria, preferring the MONITOR_CONFIG environment variable.
+
+    The repo is public, so the real venue/date window is not committed: CI passes
+    it in as a secret and only config.example.json is tracked. Locally, an
+    untracked config.json is used instead.
+    """
+    raw = os.environ.get("MONITOR_CONFIG", "").strip()
+    if raw:
+        return json.loads(raw)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"No configuration found: set MONITOR_CONFIG or create {path} "
+            "(copy config.example.json)."
+        )
 
 
 if __name__ == "__main__":

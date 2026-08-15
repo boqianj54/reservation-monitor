@@ -29,6 +29,12 @@ jobs:
       APNS_TOPIC: ${{ secrets.APNS_TOPIC }}
       APNS_DEVICE_TOKENS: ${{ secrets.APNS_DEVICE_TOKENS }}
       APNS_ENV: ${{ vars.APNS_ENV || 'sandbox' }}
+      # Search criteria live in a secret, not in the repo: this is a public
+      # repo and the venue plus date range would otherwise advertise when the
+      # user is away from home. See config.example.json for the shape.
+      MONITOR_CONFIG: ${{ secrets.MONITOR_CONFIG }}
+      # Salts the digests in state.json so the committed file reveals nothing.
+      STATE_SALT: ${{ secrets.STATE_SALT }}
     steps:
       - uses: actions/checkout@v4
 

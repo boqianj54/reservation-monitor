@@ -1,0 +1,10 @@
+{
+  "venue_slug": "example-venue-slug",
+  "venue_name": "Example Restaurant",
+  "timezone": "America/Los_Angeles",
+  "party_size": 2,
+  "date_start": "2026-01-01",
+  "date_end": "2026-01-14",
+  "earliest_time": "17:00",
+  "latest_time": "20:30"
+}

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import hmac
 import json
+import os
 import sys
 from zoneinfo import ZoneInfo
 
@@ -18,6 +21,14 @@ STATE_PATH = "state.json"
 BOOKING_URL = "https://www.sevenrooms.com/reservations/{slug}"
 # How many openings to spell out in the notification body before summarising.
 MAX_LISTED = 3
+# state.json is committed to a public repo, so entries are stored as salted
+# digests rather than "venue|party|date time" — otherwise the file would
+# publish the venue and the exact dates being watched. Without STATE_SALT the
+# values are low-entropy enough to brute-force, so the salt is a secret.
+STATE_SALT = os.environ.get("STATE_SALT", "")
+# Entries are aged out by when they were recorded (not by slot date, which we
+# deliberately no longer store). forget_vanished() does the real cleanup.
+STATE_TTL_DAYS = 180
 # Keep alerts alive for a day: the whole point of cloud hosting is that the
 # phone may be off or offline for hours, and APNs drops anything past expiry.
 ALERT_TTL_SECONDS = 24 * 3600
@@ -55,23 +66,30 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
         f.write("\n")
 
 
-def slot_date(key: str) -> str:
-    """Date portion of a state key ("venue|party|YYYY-MM-DD HH:MM:SS")."""
-    return key.rsplit("|", 1)[-1][:10]
+def state_key(opening: Opening) -> str:
+    """Opaque, stable identifier for a slot, safe to publish."""
+    return hmac.new(
+        STATE_SALT.encode(), opening.key().encode(), hashlib.sha256
+    ).hexdigest()[:32]
 
 
 def prune_state(state: dict, today: dt.date) -> dict:
-    """Drop slots whose date has passed so state.json cannot grow forever.
+    """Age out old entries so state.json cannot grow forever.
 
-    Keeps one extra day of slack so a timezone edge can never expire a slot
-    that the API is still offering.
+    Pruning is by when the entry was recorded, because the slot's own date is
+    deliberately not stored. forget_vanished() removes slots as soon as they
+    stop being offered, so this is only a long-stop.
     """
-    cutoff = (today - dt.timedelta(days=1)).isoformat()
-    state["notified"] = {
-        key: seen_at
-        for key, seen_at in state["notified"].items()
-        if slot_date(key) >= cutoff
-    }
+    cutoff = today - dt.timedelta(days=STATE_TTL_DAYS)
+    kept = {}
+    for key, seen_at in state["notified"].items():
+        try:
+            seen_date = dt.datetime.fromisoformat(seen_at).date()
+        except (TypeError, ValueError):
+            continue  # unparseable entry: drop it rather than keep it forever
+        if seen_date >= cutoff:
+            kept[key] = seen_at
+    state["notified"] = kept
     return state
 
 
@@ -80,15 +98,16 @@ def forget_vanished(state: dict, scan: ScanResult) -> list[str]:
 
     A table that gets booked and later cancelled is the single most valuable
     event this tool can catch, so once a slot disappears we must forget it —
-    otherwise its reappearance would be silently swallowed. Only days we
-    actually reached are considered, so an API failure can't cause a false
-    "vanished" and a spurious re-alert.
+    otherwise its reappearance would be silently swallowed.
+
+    Only runs when every day in the range was reached: with slot dates no longer
+    stored we cannot tell which entries a partial scan covered, so a failed day
+    would otherwise look like the slot vanished and cause a spurious re-alert.
     """
-    live = {o.key() for o in scan.openings}
-    dropped = [
-        key for key in state["notified"]
-        if slot_date(key) in scan.scanned_dates and key not in live
-    ]
+    if not scan.ok:
+        return []
+    live = {state_key(o) for o in scan.openings}
+    dropped = [key for key in state["notified"] if key not in live]
     for key in dropped:
         del state["notified"][key]
     return dropped
@@ -123,6 +142,11 @@ def main() -> int:
         action="store_true",
         help="send a single fake push to verify APNs credentials end-to-end",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print venue name, dates and slot times; omit in CI, whose logs are public",
+    )
     args = parser.parse_args()
 
     config = _load_config()
@@ -148,16 +172,23 @@ def main() -> int:
     if scan.failed_dates:
         print(f"WARNING: {len(scan.failed_dates)}/{total_days} day(s) could not be checked:")
         for date_str, err in sorted(scan.failed_dates.items()):
-            print(f"  {date_str}: {err}")
+            # Dates are only safe to print when we are not in the public log.
+            print(f"  {date_str if args.verbose else '<day>'}: {err}")
 
-    print(
-        f"Checked {config['venue_name']} "
-        f"({config['date_start']} to {config['date_end']}, "
-        f"party of {config['party_size']}): {len(scan.openings)} bookable slot(s) "
-        f"across {len(scan.scanned_dates)} day(s)."
-    )
-    for o in scan.openings:
-        print(f"  {o.date} — {o.time_label}")
+    # CI logs are public on a public repo, so the default output names neither
+    # the venue nor any date. Run locally with --verbose to see the details.
+    if args.verbose:
+        print(
+            f"Checked {config['venue_name']} "
+            f"({config['date_start']} to {config['date_end']}, "
+            f"party of {config['party_size']}): {len(scan.openings)} bookable slot(s) "
+            f"across {len(scan.scanned_dates)} day(s)."
+        )
+        for o in scan.openings:
+            print(f"  {o.date} — {o.time_label}")
+    else:
+        print(f"Checked {len(scan.scanned_dates)} day(s): "
+              f"{len(scan.openings)} bookable slot(s) in the configured window.")
 
     state = load_state()
     forgotten = forget_vanished(state, scan)
@@ -166,7 +197,7 @@ def main() -> int:
               f"(will alert again if they return).")
 
     already = state["notified"]
-    new = [o for o in scan.openings if o.key() not in already]
+    new = [o for o in scan.openings if state_key(o) not in already]
 
     today = venue_today(config)
     # A heartbeat keeps state.json changing at least daily. Without it the file
@@ -176,9 +207,10 @@ def main() -> int:
     state["last_checked_date"] = today.isoformat()
 
     if new:
-        print(f"{len(new)} newly appeared opening(s):")
-        for o in new:
-            print(f"  NEW  {o.date} — {o.time_label}")
+        print(f"{len(new)} newly appeared opening(s).")
+        if args.verbose:
+            for o in new:
+                print(f"  NEW  {o.date} — {o.time_label}")
 
     if args.dry_run:
         print("Dry run — no notification sent, state not saved.")
@@ -203,11 +235,12 @@ def main() -> int:
                 "notified. The app was probably reinstalled; refresh the "
                 "APNS_DEVICE_TOKENS secret from the app."
             )
-        print(f"Notified: {title} — {body}")
+        print(f"Notified: {title} — {body}" if args.verbose
+              else f"Notified {len(new)} opening(s).")
 
         now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         for o in new:
-            already[o.key()] = now
+            already[state_key(o)] = now
     else:
         print("Nothing new to notify.")
 
