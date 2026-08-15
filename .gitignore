@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+# Runtime state (already-notified slots) — do not commit if it holds secrets/noise.
+# Keep committed only if you deliberately use it as the state store for GitHub Actions.
+state.local.json
+
+# APNs auth key — must never be committed; lives in a GitHub secret instead.
+*.p8
+
+# Xcode
+ios/**/build/
+ios/**/xcuserdata/
+ios/**/DerivedData/
+.DS_Store
+
+# Local-only project context for Claude (personal notes)
+CLAUDE.md

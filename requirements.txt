@@ -1,0 +1,4 @@
+# Only needed to *send* pushes; check.py itself remains stdlib-only.
+# APNs requires HTTP/2, which urllib cannot speak.
+httpx[http2]==0.28.1
+PyJWT[crypto]==2.10.1
