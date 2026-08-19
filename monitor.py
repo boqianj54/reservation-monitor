@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 from check import Opening, ScanResult, find_openings, _load_config
@@ -41,6 +42,12 @@ ALERT_TTL_SECONDS = 24 * 3600
 # Fail the run if more than this fraction of days could not be checked, so a
 # widespread outage goes red instead of quietly reporting "no openings".
 MAX_FAILED_FRACTION = 0.5
+# --watch polls this often. GitHub's cron floor is 5 minutes and it commonly
+# lags another 5-15, so a single long-running job polling on its own clock is
+# the only way to get sub-5-minute latency. Kept at a minute rather than
+# seconds: this is a public courtesy endpoint and each cycle costs one request
+# per day in the range.
+WATCH_INTERVAL_SECONDS = 60
 
 
 def venue_today(config: dict) -> dt.date:
@@ -147,6 +154,78 @@ def format_alert(openings: list[Opening], config: dict) -> tuple[str, str]:
     return title, body
 
 
+def run_once(config: dict, state: dict, args) -> tuple[int, ScanResult]:
+    """One check. Returns (number notified, scan) and mutates state in place."""
+    scan = find_openings(config)
+    total_days = len(scan.scanned_dates) + len(scan.failed_dates)
+    if scan.failed_dates:
+        print(f"WARNING: {len(scan.failed_dates)}/{total_days} day(s) could not be checked:")
+        for date_str, err in sorted(scan.failed_dates.items()):
+            # Dates are only safe to print when we are not in the public log.
+            print(f"  {date_str if args.verbose else '<day>'}: {err}")
+
+    # CI logs are public on a public repo, so the default output names neither
+    # the venue nor any date. Run locally with --verbose to see the details.
+    if args.verbose:
+        print(
+            f"Checked {config['venue_name']} "
+            f"({config['date_start']} to {config['date_end']}, "
+            f"party of {config['party_size']}): {len(scan.openings)} bookable slot(s) "
+            f"across {len(scan.scanned_dates)} day(s)."
+        )
+        for o in scan.openings:
+            print(f"  {o.date} — {o.time_label}")
+    else:
+        print(f"Checked {len(scan.scanned_dates)} day(s): "
+              f"{len(scan.openings)} bookable slot(s) in the configured window.")
+
+    forgotten = forget_vanished(state, scan)
+    if forgotten:
+        print(f"{len(forgotten)} previously-notified slot(s) no longer offered "
+              f"(will alert again if they return).")
+
+    already = state["notified"]
+    new = [o for o in scan.openings if state_key(o) not in already]
+    state["last_checked_date"] = venue_today(config).isoformat()
+
+    if not new:
+        print("Nothing new to notify.")
+        return 0, scan
+
+    print(f"{len(new)} newly appeared opening(s).")
+    if args.verbose:
+        for o in new:
+            print(f"  NEW  {o.date} — {o.time_label}")
+    if args.dry_run:
+        return len(new), scan
+
+    import notify
+
+    title, body = format_alert(new, config)
+    invalid = notify.send(
+        title,
+        body,
+        collapse_id=None,  # each alert must stand alone; see notify.send
+        extra={"url": booking_url(new[0], config)},
+        expiration_seconds=ALERT_TTL_SECONDS,
+    )
+    if invalid and len(invalid) == len(notify.device_tokens()):
+        # Every device is unreachable, so nobody was told. Fail loudly and
+        # do NOT record these as notified, or the alert is lost forever.
+        raise RuntimeError(
+            "APNs rejected every configured device token — no one was "
+            "notified. The app was probably reinstalled; refresh the "
+            "APNS_DEVICE_TOKENS secret from the app."
+        )
+    print(f"Notified: {title} — {body}" if args.verbose
+          else f"Notified {len(new)} opening(s).")
+
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    for o in new:
+        already[state_key(o)] = now
+    return len(new), scan
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -158,6 +237,13 @@ def main() -> int:
         "--test-notification",
         action="store_true",
         help="send a single fake push to verify APNs credentials end-to-end",
+    )
+    parser.add_argument(
+        "--watch",
+        type=int,
+        metavar="MINUTES",
+        default=0,
+        help=f"keep polling every {WATCH_INTERVAL_SECONDS}s for this many minutes",
     )
     parser.add_argument(
         "--verbose",
@@ -184,91 +270,46 @@ def main() -> int:
         print("Test notification sent.")
         return 0
 
-    scan = find_openings(config)
-    total_days = len(scan.scanned_dates) + len(scan.failed_dates)
-    if scan.failed_dates:
-        print(f"WARNING: {len(scan.failed_dates)}/{total_days} day(s) could not be checked:")
-        for date_str, err in sorted(scan.failed_dates.items()):
-            # Dates are only safe to print when we are not in the public log.
-            print(f"  {date_str if args.verbose else '<day>'}: {err}")
-
-    # CI logs are public on a public repo, so the default output names neither
-    # the venue nor any date. Run locally with --verbose to see the details.
-    if args.verbose:
-        print(
-            f"Checked {config['venue_name']} "
-            f"({config['date_start']} to {config['date_end']}, "
-            f"party of {config['party_size']}): {len(scan.openings)} bookable slot(s) "
-            f"across {len(scan.scanned_dates)} day(s)."
-        )
-        for o in scan.openings:
-            print(f"  {o.date} — {o.time_label}")
-    else:
-        print(f"Checked {len(scan.scanned_dates)} day(s): "
-              f"{len(scan.openings)} bookable slot(s) in the configured window.")
-
     state = load_state()
-    forgotten = forget_vanished(state, scan)
-    if forgotten:
-        print(f"{len(forgotten)} previously-notified slot(s) no longer offered "
-              f"(will alert again if they return).")
-
-    already = state["notified"]
-    new = [o for o in scan.openings if state_key(o) not in already]
-
     today = venue_today(config)
-    # A heartbeat keeps state.json changing at least daily. Without it the file
-    # only changes when an opening appears, and GitHub disables scheduled
-    # workflows on repos with no activity for 60 days — which for a venue that
-    # books out months ahead means the monitor switches itself off unnoticed.
-    state["last_checked_date"] = today.isoformat()
 
-    if new:
-        print(f"{len(new)} newly appeared opening(s).")
-        if args.verbose:
-            for o in new:
-                print(f"  NEW  {o.date} — {o.time_label}")
-
-    if args.dry_run:
-        print("Dry run — no notification sent, state not saved.")
+    if not args.watch:
+        notified, scan = run_once(config, state, args)
+        if args.dry_run:
+            print("Dry run — no notification sent, state not saved.")
+            return 0
+        save_state(prune_state(state, today))
+        total_days = len(scan.scanned_dates) + len(scan.failed_dates)
+        if total_days and len(scan.failed_dates) / total_days > MAX_FAILED_FRACTION:
+            raise RuntimeError(
+                f"{len(scan.failed_dates)} of {total_days} days could not be checked; "
+                "availability results are unreliable."
+            )
         return 0
 
-    if new:
-        import notify
+    # Watch mode: keep polling on our own clock until the deadline, so latency
+    # is WATCH_INTERVAL_SECONDS instead of GitHub's 5-minute cron floor plus lag.
+    deadline = time.monotonic() + args.watch * 60
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"--- cycle {cycle} ---", flush=True)
+        try:
+            notified, _ = run_once(config, state, args)
+            if notified and not args.dry_run:
+                # Persist immediately so a crash mid-watch cannot replay alerts.
+                save_state(prune_state(state, today))
+        except Exception as exc:  # keep watching; a transient blip is not fatal
+            print(f"  cycle failed: {type(exc).__name__}: {exc}", flush=True)
 
-        title, body = format_alert(new, config)
-        invalid = notify.send(
-            title,
-            body,
-            collapse_id=None,  # each alert must stand alone; see notify.send
-            extra={"url": booking_url(new[0], config)},
-            expiration_seconds=ALERT_TTL_SECONDS,
-        )
-        if invalid and len(invalid) == len(notify.device_tokens()):
-            # Every device is unreachable, so nobody was told. Fail loudly and
-            # do NOT record these as notified, or the alert is lost forever.
-            raise RuntimeError(
-                "APNs rejected every configured device token — no one was "
-                "notified. The app was probably reinstalled; refresh the "
-                "APNS_DEVICE_TOKENS secret from the app."
-            )
-        print(f"Notified: {title} — {body}" if args.verbose
-              else f"Notified {len(new)} opening(s).")
+        remaining = deadline - time.monotonic()
+        if remaining <= WATCH_INTERVAL_SECONDS:
+            break
+        time.sleep(WATCH_INTERVAL_SECONDS)
 
-        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-        for o in new:
-            already[state_key(o)] = now
-    else:
-        print("Nothing new to notify.")
-
-    save_state(prune_state(state, today))
-
-    # Surface a widespread outage as a failed run rather than a quiet "0 slots".
-    if total_days and len(scan.failed_dates) / total_days > MAX_FAILED_FRACTION:
-        raise RuntimeError(
-            f"{len(scan.failed_dates)} of {total_days} days could not be checked; "
-            "availability results are unreliable."
-        )
+    if not args.dry_run:
+        save_state(prune_state(state, today))
+    print(f"Watch finished after {cycle} cycle(s).")
     return 0
 
 

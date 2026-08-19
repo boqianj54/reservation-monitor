@@ -124,10 +124,15 @@ def send(
     same id. Pass None (the default) when each alert lists different openings,
     otherwise a second alert silently overwrites the first one the user never saw.
     """
-    # A "time-sensitive" interruption-level would break through Focus modes, but
-    # it needs an extra entitlement on the App ID; add it once basic delivery works.
+    # "time-sensitive" breaks through Focus and Do Not Disturb, which is the
+    # whole point here: a table can vanish in minutes, so a muted alert is as
+    # good as no alert. Requires the matching entitlement in the iOS app.
     payload: dict = {
-        "aps": {"alert": {"title": title, "body": body}, "sound": "default"}
+        "aps": {
+            "alert": {"title": title, "body": body},
+            "sound": "default",
+            "interruption-level": "time-sensitive",
+        }
     }
     if extra:
         # Merge alongside "aps" rather than over it, so caller data can never

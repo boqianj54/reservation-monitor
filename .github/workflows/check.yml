@@ -2,9 +2,11 @@ name: Check reservation availability
 
 on:
   schedule:
-    # Every 5 minutes is the GitHub cron minimum; runs on the free tier are
-    # best-effort and can lag by 5-15 minutes under load.
-    - cron: "*/5 * * * *"
+    # GitHub's cron floor is 5 minutes and it commonly lags another 5-15, which
+    # is too slow: a table can be gone before the next tick. So each run instead
+    # stays alive and polls on its own clock (see --watch), and the schedule just
+    # keeps a watcher running. Runs slightly overlap so coverage is continuous.
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       test_notification:
@@ -20,6 +22,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: write
     env:
@@ -49,9 +52,10 @@ jobs:
         if: inputs.test_notification
         run: python monitor.py --test-notification
 
-      - name: Check availability and notify
+      - name: Watch availability and notify
         if: ${{ !inputs.test_notification }}
-        run: python monitor.py
+        timeout-minutes: 35
+        run: python monitor.py --watch 29
 
       - name: Commit updated state
         if: ${{ !inputs.test_notification }}
