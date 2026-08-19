@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 from check import Opening, ScanResult, find_openings, _load_config
 
 STATE_PATH = "state.json"
-BOOKING_URL = "https://www.sevenrooms.com/reservations/{slug}"
+# Deep link straight into the booking widget with the slot preselected, so the
+# alert lands on the form with only payment left to do. The older
+# /reservations/{slug} path 302s and 404s once query params are added.
+BOOKING_URL = (
+    "https://www.sevenrooms.com/explore/{slug}/reservations/create/search"
+    "?date={date}&party_size={party}&start_time={time}"
+)
 # How many openings to spell out in the notification body before summarising.
 MAX_LISTED = 3
 # state.json is committed to a public repo, so entries are stored as salted
@@ -111,6 +117,17 @@ def forget_vanished(state: dict, scan: ScanResult) -> list[str]:
     for key in dropped:
         del state["notified"][key]
     return dropped
+
+
+def booking_url(opening: Opening, config: dict) -> str:
+    """Link that opens the booking form with this slot already selected."""
+    d = dt.date.fromisoformat(opening.date)
+    return BOOKING_URL.format(
+        slug=config["venue_slug"],
+        date=d.strftime("%m-%d-%Y"),   # SevenRooms wants MM-DD-YYYY
+        party=config["party_size"],
+        time=opening.time_iso[11:16],
+    )
 
 
 def format_alert(openings: list[Opening], config: dict) -> tuple[str, str]:
@@ -224,7 +241,7 @@ def main() -> int:
             title,
             body,
             collapse_id=None,  # each alert must stand alone; see notify.send
-            extra={"url": BOOKING_URL.format(slug=config["venue_slug"])},
+            extra={"url": booking_url(new[0], config)},
             expiration_seconds=ALERT_TTL_SECONDS,
         )
         if invalid and len(invalid) == len(notify.device_tokens()):
