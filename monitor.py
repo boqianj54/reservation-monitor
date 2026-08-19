@@ -42,12 +42,14 @@ ALERT_TTL_SECONDS = 24 * 3600
 # Fail the run if more than this fraction of days could not be checked, so a
 # widespread outage goes red instead of quietly reporting "no openings".
 MAX_FAILED_FRACTION = 0.5
-# --watch polls this often. GitHub's cron floor is 5 minutes and it commonly
-# lags another 5-15, so a single long-running job polling on its own clock is
-# the only way to get sub-5-minute latency. Kept at a minute rather than
-# seconds: this is a public courtesy endpoint and each cycle costs one request
-# per day in the range.
-WATCH_INTERVAL_SECONDS = 60
+# --watch polls this often. The big win over cron is not the interval itself but
+# losing GitHub's 5-15 min queue lag: watch mode polls on its own clock, so even
+# a 5-minute interval gives a deterministic bound. Each cycle costs one request
+# per day in the range, so the rate is 5 req/interval here. Kept at 3 minutes to
+# stay well clear of rate-limiting: being IP-blocked would cost us the monitor
+# entirely, which is far worse than a few minutes of latency. Override with the
+# WATCH_INTERVAL_SECONDS repo variable; don't go below ~60s.
+WATCH_INTERVAL_SECONDS = max(30, int(os.environ.get("WATCH_INTERVAL_SECONDS", "180")))
 
 
 def venue_today(config: dict) -> dt.date:

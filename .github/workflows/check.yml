@@ -38,6 +38,8 @@ jobs:
       MONITOR_CONFIG: ${{ secrets.MONITOR_CONFIG }}
       # Salts the digests in state.json so the committed file reveals nothing.
       STATE_SALT: ${{ secrets.STATE_SALT }}
+      # Poll interval for --watch, tunable without a code change.
+      WATCH_INTERVAL_SECONDS: ${{ vars.WATCH_INTERVAL_SECONDS || '180' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +57,7 @@ jobs:
       - name: Watch availability and notify
         if: ${{ !inputs.test_notification }}
         timeout-minutes: 35
-        run: python monitor.py --watch 29
+        run: python -u monitor.py --watch 29
 
       - name: Commit updated state
         if: ${{ !inputs.test_notification }}
